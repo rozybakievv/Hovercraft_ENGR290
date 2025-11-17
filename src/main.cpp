@@ -6,8 +6,11 @@
 #include <avr/interrupt.h>
 
 #define LIFT_FAN PD4
-#define TRIG_PIN PB3  // Trigger pin
-#define ECHO_PIN PD2  // Echo pin (PD2) - INT0
+
+#define TRIG_PIN_LEFT PB3  // Trigger pin
+#define ECHO_PIN_LEFT PD2  // Echo pin (PD2) - INT0
+#define TRIG_PIN_RIGHT PB5  // Trigger pin
+#define ECHO_PIN_RIGHT PD3  // Echo pin (PD2) - INT0
 
 #define FAN_THRUST_PIN PD6
 
@@ -53,11 +56,22 @@ void setup() {
     OCR0A = 0;  // Start at 0
 
     // Configure TRIG_PIN as OUTPUT
-    DDRB |= (1 << TRIG_PIN);
-    PORTB &= ~(1 << TRIG_PIN);
+    DDRB |= (1 << TRIG_PIN_LEFT);
+    PORTB &= ~(1 << TRIG_PIN_LEFT);
 
     // Configure ECHO_PIN as INPUT
-    DDRD &= ~(1 << ECHO_PIN);
+    DDRD &= ~(1 << ECHO_PIN_LEFT);
+
+    // Configure TRIG_PIN_RIGHT as OUTPUT
+    DDRB |= (1 << TRIG_PIN_RIGHT);
+    PORTB &= ~(1 << TRIG_PIN_RIGHT);
+
+    // Configure ECHO_PIN_RIGHT as INPUT
+    DDRD &= ~(1 << ECHO_PIN_RIGHT);
+    
+    // Configure INT1 interrupt for rising edge (RIGHT sensor)
+    EICRA |= (1 << ISC11) | (1 << ISC10);  // Rising edge on INT1
+    EIMSK |= (1 << INT1);  // Enable INT1
 
     // Configure INT0 interrupt for rising edge
     // External Interrupt Control Register A (EICRA) -> Controls when the interrupt triggers (rising edge)
@@ -163,16 +177,20 @@ uint16_t getDistanceTop() {
 
 // --- US Sensor Functions --- //
 // Variables for interrupt handling
-volatile uint32_t pulse_start = 0;
-volatile uint32_t pulse_width = 0;
-volatile uint8_t measurement_ready = 0;
+volatile uint32_t pulse_start_left = 0;
+volatile uint32_t pulse_width_left = 0;
+volatile uint8_t measurement_ready_left = 0;
 
-// INT0 interrupt - triggered on both rising and falling edges
+volatile uint32_t pulse_start_right = 0;
+volatile uint32_t pulse_width_right = 0;
+volatile uint8_t measurement_ready_right = 0;
+
+// INT0 interrupt (left us sensor) - triggered on both rising and falling edges
 ISR(INT0_vect) {
     // Check rising edge (echo pin HIGH -> sent echo pulse can start timer)
-    if (PIND & (1 << ECHO_PIN)) {
+    if (PIND & (1 << ECHO_PIN_LEFT)) {
         // Rising edge - start measurement timer
-        pulse_start = TCNT1;
+        pulse_start_left = TCNT1;
         // Change to falling edge trigger
         EICRA |= (1 << ISC01);
         EICRA &= ~(1 << ISC00);
@@ -181,42 +199,101 @@ ISR(INT0_vect) {
         uint32_t pulse_end = TCNT1;
         
         // Handle timer overflow
-        if (pulse_end < pulse_start) {
-            pulse_width = (65536 - pulse_start) + pulse_end;
+        if (pulse_end < pulse_start_left) {
+            pulse_width_left = (65536 - pulse_start_left) + pulse_end;
         } else {
-            pulse_width = pulse_end - pulse_start;
+            pulse_width_left = pulse_end - pulse_start_left;
         }
         
         // Convert to microseconds (Timer1 with prescaler 8)
-        pulse_width = (pulse_width * 8) / (F_CPU / 1000000);
+        pulse_width_left = (pulse_width_left * 8) / (F_CPU / 1000000);
         
-        measurement_ready = 1;
+        measurement_ready_left = 1;
         
         // Change back to rising edge trigger for next measurement
         EICRA |= (1 << ISC01) | (1 << ISC00);
     }
 }
 
+// INT1 interrupt (RIGHT us sensor) - triggered on both rising and falling edges
+ISR(INT1_vect) {
+    // Check rising edge (echo pin HIGH -> sent echo pulse can start timer)
+    if (PIND & (1 << ECHO_PIN_RIGHT)) {
+        // Rising edge - start measurement timer
+        pulse_start_right = TCNT1;
+        // Change to falling edge trigger for INT1
+        EICRA |= (1 << ISC11);
+        EICRA &= ~(1 << ISC10);
+    } else {
+        // Falling edge - end measurement timer -> pulse received back
+        uint32_t pulse_end = TCNT1;
+        
+        // Handle timer overflow
+        if (pulse_end < pulse_start_right) {
+            pulse_width_right = (65536 - pulse_start_right) + pulse_end;
+        } else {
+            pulse_width_right = pulse_end - pulse_start_right;
+        }
+        
+        // Convert to microseconds (Timer1 with prescaler 8)
+        pulse_width_right = (pulse_width_right * 8) / (F_CPU / 1000000);
+        
+        measurement_ready_right = 1;
+        
+        // Change back to rising edge trigger for next measurement
+        EICRA |= (1 << ISC11) | (1 << ISC10);
+    }
+}
+
 void sendTriggerPulse() {
-    measurement_ready = 0;
-    PORTB &= ~(1 << TRIG_PIN); // Make sure trigger pin is LOW
+    measurement_ready_left = 0;
+    PORTB &= ~(1 << TRIG_PIN_LEFT); // Make sure trigger pin is LOW
     _delay_us(2);              
-    PORTB |= (1 << TRIG_PIN);  // Send trigger pulse HIGH
+    PORTB |= (1 << TRIG_PIN_LEFT);  // Send trigger pulse HIGH
     _delay_us(10);             // Pulse width
-    PORTB &= ~(1 << TRIG_PIN); // Ensure trigger pin is LOW again
+    PORTB &= ~(1 << TRIG_PIN_LEFT); // Ensure trigger pin is LOW again
+}
+
+void sendTriggerPulseRight() {
+    measurement_ready_right = 0;
+    PORTB &= ~(1 << TRIG_PIN_RIGHT); // Make sure trigger pin is LOW
+    _delay_us(2);              
+    PORTB |= (1 << TRIG_PIN_RIGHT);  // Send trigger pulse HIGH
+    _delay_us(10);             // Pulse width
+    PORTB &= ~(1 << TRIG_PIN_RIGHT); // Ensure trigger pin is LOW again
+}
+
+uint32_t getDistanceRight() {
+    sendTriggerPulseRight();
+
+    uint16_t timeout = 100000;
+    while (!measurement_ready_right && timeout--) {
+        _delay_us(1);
+    }
+
+    if (measurement_ready_right == 1)
+    {
+        uint32_t duration = pulse_width_right;
+        // Speed of sound is 0.0343 cm/us
+        // Distance = (duration * 343) / 20000
+        uint32_t distance = (duration * 343) / 20000;
+        return distance;
+    }
+
+    return 9999;
 }
 
 uint32_t getDistanceLeft() {
     sendTriggerPulse();
 
     uint16_t timeout = 100000;
-    while (!measurement_ready && timeout--) {
+    while (!measurement_ready_left && timeout--) {
         _delay_us(1);
     }
 
-    if (measurement_ready == 1)
+    if (measurement_ready_left == 1)
     {
-        uint32_t duration = pulse_width;
+        uint32_t duration = pulse_width_left;
         // Speed of sound is 0.0343 cm/us
         // Distance = (duration * 343) / 20000
         uint32_t distance = (duration * 343) / 20000;
@@ -417,23 +494,35 @@ int main() {
         
 
         // US Sensor test
-        uint32_t distanceLeft32 = getDistanceLeft();
+        /* uint32_t distanceLeft32 = getDistanceLeft();
         if (distanceLeft32 == 9999)
         {
-            uartPrint("US Sensor left error");
+            uartPrint("US Sensor left error\r\n");
         } else {
+            uartPrint("LEFT: ");
             uartPrintInt(distanceLeft32);
             uartPrint("cm \r\n");
         }
 
-        _delay_ms(500);
+        uint32_t distanceRight32 = getDistanceRight();
+        if (distanceRight32 == 9999) {
+            uartPrint("US Sensor right error\r\n");
+        } else {
+            uartPrint("RIGHT: ");
+            uartPrintInt(distanceRight32);
+            uartPrint(" cm\r\n");
+        }
+
+        _delay_ms(500); */
 
         // Test lift fan
-		/* startLiftFan();
+		startLiftFan();
+        setThrustFan(200);
 		uartPrint("Starting...\r\n");
-		_delay_ms(15000);
+		_delay_ms(20000);
 		uartPrint("Stopping...\r\n");
 		stopLiftFan();
-		_delay_ms(5000);*/
+        setThrustFan(0);
+		_delay_ms(5000);
 	}
 }
