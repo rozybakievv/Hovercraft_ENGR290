@@ -6,13 +6,14 @@
 #include <avr/interrupt.h>
 
 #define LIFT_FAN PD4
+#define FAN_THRUST_PIN PD6
 
 #define TRIG_PIN_LEFT PB3  // Trigger pin
 #define ECHO_PIN_LEFT PD2  // Echo pin (PD2) - INT0
 #define TRIG_PIN_RIGHT PB5  // Trigger pin
 #define ECHO_PIN_RIGHT PD3  // Echo pin (PD2) - INT0
 
-#define FAN_THRUST_PIN PD6
+#define SERVO_PIN PB1 // for OC1A
 
 #define IR_PIN 0  // ADC channel for IR sensor (A0 / PC0)
 
@@ -38,9 +39,15 @@ void setup() {
     UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
 
 	// Timer1
-    TCCR1A = 0;
-    TCCR1B |= (1 << CS11); // Prescaler 8
-    TCNT1 = 0;
+    // Configure Timer1 for servo control (50Hz PWM for servo)
+    TCCR1A = (1 << COM1A1) | (1 << WGM11);  // Non-inverting mode on OC1A
+    TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS11);  // Prescaler 8
+
+    // Timer2 init in CTC mode, interrupt every 1ms -> schedule for sensors
+    TCCR2A = (1 << WGM21);  // CTC mode
+    TCCR2B = (1 << CS22) | (1 << CS20);  // Prescaler 128
+    OCR2A = 124;  // (16MHz / (128 * 125)) = 1000Hz = 1ms
+    TIMSK2 = (1 << OCIE2A);  // Enable compare match interrupt
 
     // PD4 as output (Lift Fan)
     DDRD |= (1 << PD4);
@@ -50,7 +57,7 @@ void setup() {
     // PD6 as output (Thrust Fan - OC0A)
     DDRD |= (1 << PD6);
 
-    // Configure Timer0 for Fast PWM on OC0A (PD6)
+    // Configure Timer0 for Fast PWM on OC0A (PD6) -> Thrust fan
     TCCR0A = (1 << COM0A1) | (1 << WGM01) | (1 << WGM00);  // Fast PWM, non-inverting
     TCCR0B = (1 << CS01) | (1 << CS00);  // Prescaler 64 → ~490Hz
     OCR0A = 0;  // Start at 0
@@ -78,12 +85,41 @@ void setup() {
     EICRA |= (1 << ISC01) | (1 << ISC00);  // Rising edge
     // External Interrupt Mask Register (EIMSK) -> Enables specific interrupt (PD2 -> INT0)
     EIMSK |= (1 << INT0);  // Enable INT0
+
+    // PB1 -> output for servo
+    DDRB |= (1 << SERVO_PIN);
+
+    // Set TOP value for 50Hz: (16MHz / (8 * 50Hz)) - 1 = 39999
+    ICR1 = 39999;
+    
+    // Initialize servo to center position (1.5ms pulse)
+    OCR1A = 3000;  // Center position
     
     // Enable global interrupts
     sei();
 }
 
-// --- UART Functions --- //
+// Timer2 System Scheduler Interrupt setup
+ISR(TIMER2_COMPA_vect) {
+    system_millis++;  // System timing tracker
+    
+    // Schedule IMU reading every 5ms
+    if (system_millis % IMU_UPDATE_INTERVAL == 0) {
+        imu_ready = 1;
+    }
+    
+    // Schedule LEFT US TRIGGER every 50ms
+    if (system_millis % US_UPDATE_INTERVAL == 0) {
+        us_left_trigger = 1;
+    }
+    
+    // Schedule RIGHT US TRIGGER every 50ms with offset by 25ms
+    if (system_millis % US_UPDATE_INTERVAL == 25) {
+        us_right_trigger = 1;
+    }
+}
+
+// ---------------- UART Functions ---------------- //
 void uartTransmit(char c) {
     while (!(UCSR0A & (1 << UDRE0))); // Wait until buffer is empty
     UDR0 = c;
@@ -107,7 +143,7 @@ void uartPrintFloat(float num) {
     uartPrint(buffer);
 }
 
-// ---- I2C Functions ---- //
+// ---------------- I2C Functions ---------------- //
 void i2c_init(void) {
     TWSR = 0x00;  // prescaler = 1
     TWBR = 12;    // ~400kHz @ 16MHz
@@ -141,7 +177,7 @@ uint8_t i2c_read_ack(void) {
     return TWDR;
 }
 
-// --- IR Sensor Functions --- //
+// ---------------- IR Sensor Functions ---------------- //
 void ADC_init() {
     ADMUX = (1 << REFS0); // AVcc 5v as reference
     ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0); // enable ADC, prescaler 128 (ADC clock = 125kHz)
@@ -154,29 +190,27 @@ uint16_t readADC(uint8_t channel) {
     return ADCW; // return 10 bit ADC result
 }
 
-uint16_t getDistanceTop() {
-    uint16_t sensorValueRaw = readADC(IR_PIN);
-
-    if (sensorValueRaw == 0) {
-        uartPrint("Error: ADC returned 0!\r\n");
-        return 0;
-    }
+void update_ir() {
+    uint32_t current_time = system_millis;
     
-    // IR sensor calibration equation
-    float distance = (6787.0 / (sensorValueRaw - 3.0)) - 4.0;
-
-    // range check
-    if (distance < 0 || distance > 200) {
-        uartPrint("Error: Out of range!\r\n");
-        return 0;
+    // Check if can read IR
+    if (current_time - last_ir_time < IR_UPDATE_INTERVAL) 
+    {
+        return;
     }
 
-    return (uint16_t)distance;
+    last_ir_time = current_time;
+    
+    uint16_t sensorValue = readADC(IR_PIN);
+    if (sensorValue > 3) {
+        float distance = (6787.0 / (sensorValue - 3.0)) - 4.0;
+        if (distance >= 0 && distance <= 200) {
+            latest_ir_distance = (uint16_t)distance;
+        }
+    }
 }
 
-
-// --- US Sensor Functions --- //
-// Variables for interrupt handling
+// ---------------- US Sensor Functions ---------------- //
 volatile uint32_t pulse_start_left = 0;
 volatile uint32_t pulse_width_left = 0;
 volatile uint8_t measurement_ready_left = 0;
@@ -215,7 +249,7 @@ ISR(INT0_vect) {
     }
 }
 
-// INT1 interrupt (RIGHT us sensor) - triggered on both rising and falling edges
+// INT1 interrupt (right us sensor) - triggered on both rising and falling edges
 ISR(INT1_vect) {
     // Check rising edge (echo pin HIGH -> sent echo pulse can start timer)
     if (PIND & (1 << ECHO_PIN_RIGHT)) {
@@ -263,47 +297,37 @@ void sendTriggerPulseRight() {
     PORTB &= ~(1 << TRIG_PIN_RIGHT); // Ensure trigger pin is LOW again
 }
 
-uint32_t getDistanceRight() {
-    sendTriggerPulseRight();
-
-    uint16_t timeout = 100000;
-    while (!measurement_ready_right && timeout--) {
-        _delay_us(1);
-    }
-
-    if (measurement_ready_right == 1)
-    {
-        uint32_t duration = pulse_width_right;
-        // Speed of sound is 0.0343 cm/us
-        // Distance = (duration * 343) / 20000
-        uint32_t distance = (duration * 343) / 20000;
-        return distance;
-    }
-
-    return 9999;
-}
-
-uint32_t getDistanceLeft() {
+// US trigger (called from main)
+void trigger_ultrasonic_left() {
+    if (!us_left_trigger) return;
+    us_left_trigger = 0;
     sendTriggerPulse();
-
-    uint16_t timeout = 100000;
-    while (!measurement_ready_left && timeout--) {
-        _delay_us(1);
-    }
-
-    if (measurement_ready_left == 1)
-    {
-        uint32_t duration = pulse_width_left;
-        // Speed of sound is 0.0343 cm/us
-        // Distance = (duration * 343) / 20000
-        uint32_t distance = (duration * 343) / 20000;
-        return distance;
-    }
-
-    return 9999;
 }
 
-// --- Fan Functions --- //
+void trigger_ultrasonic_right() {
+    if (!us_right_trigger) return;
+    us_right_trigger = 0;
+    sendTriggerPulseRight();
+}
+
+// Check if US pulse measurement is complete (called from main)
+void check_ultrasonic_left() {
+    if (measurement_ready_left) {
+        uint32_t duration = pulse_width_left;
+        latest_left_distance = (duration * 343) / 20000;
+        measurement_ready_left = 0;
+    }
+}
+
+void check_ultrasonic_right() {
+    if (measurement_ready_right) {
+        uint32_t duration = pulse_width_right;
+        latest_right_distance = (duration * 343) / 20000;
+        measurement_ready_right = 0;
+    }
+}
+
+// ---------------- Fan Functions ---------------- //
 void startLiftFan() {
 	PORTD |= (1<<PD4);
 }
@@ -317,15 +341,14 @@ void setThrustFan(uint8_t speed) // 0 to 255 value
     OCR0A = speed;
 }
 
-
-// --- IMU Sensor Functions --- //
+// ---------------- IMU Sensor Functions ---------------- //
 void mpu6050_init(void) {
     uartPrint("Initializing MPU6050...\r\n");
     
     // Wake up MPU-6050
     i2c_start();
     i2c_write((IMU_ADDR << 1) | 0);
-    i2c_write(0x6B); // PWR_MGMT_1
+    i2c_write(0x6B); // PWR_MGMT_1 register
     i2c_write(0x00);
     i2c_stop();
 
@@ -342,7 +365,7 @@ void mpu6050_init(void) {
 
     i2c_start();
     i2c_write((IMU_ADDR << 1) | 0);
-    i2c_write(0x1C);  // GYRO_CONFIG register
+    i2c_write(0x1C);  // ACCEL_CONFIG register
     i2c_write(0x08);  // Bits 4:3 set the range
     i2c_stop();
     acc_scale = 8192.0f;
@@ -357,7 +380,7 @@ void readIMUCalibration() {
     // Write starting register, then repeated start for read
     i2c_start();
     i2c_write((IMU_ADDR << 1) | 0);
-    i2c_write(0x3B); // ACCEL_XOUT_H
+    i2c_write(0x3B); // ACCEL_XOUT_H - where data starts
     i2c_start();
     i2c_write((IMU_ADDR << 1) | 1);
     for (uint8_t i = 0; i < 13; i++) data[i] = i2c_read_ack();
@@ -419,110 +442,83 @@ void calibration() {
     uartPrint("Calibration complete !");
 }
 
-void getRoll() {
-    roll = atan2(-accX, accZ) * 180.0f / M_PI;
+void update_imu() {
+    if (!imu_ready) return;
+    imu_ready = 0;
+    
+    readIMU();
+    yaw += gyrZ * (IMU_UPDATE_INTERVAL / 1000.0f);  // Integration with actual dt -> 5/10^3 = 5ms
+}
+
+// ---------------- Servo Functions ---------------- //
+void set_servo_angle(float yaw) {
+    // Constrain angle to valid range
+    if (yaw < -220) yaw = -180;
+    if (yaw > 220) yaw = 180;
+    
+    uint16_t pulse = 3000 + (yaw * 1000) / 180;
+    
+    OCR1A = pulse;
 }
 
 int main() {
-    // Input / Outputs setup and sensors initialization
+    // ---------------- SYSTEM INIT ---------------- //
 	setup();
     _delay_ms(5);
-    // i2c_init();
+    i2c_init();
     _delay_ms(5);
-    // ADC_init();
+    ADC_init();
     _delay_ms(5);
-    // mpu6050_init();
+    mpu6050_init();
     _delay_ms(5);
-    // calibration();
+    calibration();
+    sei();
     uartPrint("Hovercraft Initialized ! \r\n");
 
-    int counter = 0;
+    int print_counter = 0;
 
-	// Main loop
+    // Main loop
 	while (1)
 	{
-        // PWM THRUST
-        /* setThrustFan(30);
-        uartPrint("Thrust fan set to 255\r\n");
-        uartPrintInt(OCR0A);
-        uartPrint("\r\n");
-        _delay_ms(1000); */
+        // ---------------- READ SENSORS ---------------- // 
+        // Time tracker
+        uint32_t current_time = system_millis;
+    
+        update_imu();
+        
+        trigger_ultrasonic_left();
+        trigger_ultrasonic_right();
+        check_ultrasonic_left();
+        check_ultrasonic_right();
+        
+        update_ir();
 
-
-        // IMU Sensor
-        /* readIMU();
-        yaw += gyrZ * 0.01f; // gyroscope z-axis data over time (0.01f seconds delay)
-
-        getRoll();
-
-        // prints only 100 iterations (1s)
-        if (counter >= 100) {
-            uartPrint("Acc - X:");
+        // ---------------- DEBUGGING ---------------- // 
+        // Print every 500ms
+        if (++print_counter >= 50) {
+            print_counter = 0;
+            // Print IMU data (acceleration and yaw)
+            uartPrint("Acc X:");
             uartPrintFloat(accX);
             uartPrint(" Y:");
             uartPrintFloat(accY);
             uartPrint(" Z:");
             uartPrintFloat(accZ);
             
-            uartPrint("| Yaw: ");
+            uartPrint(" | Yaw:");
             uartPrintFloat(yaw);
-
-            uartPrint("\r\n");
-
-            counter = 0;
+            
+            // Print sensor distances
+            uartPrint(" | L:");
+            uartPrintInt(latest_left_distance);
+            uartPrint("cm R:");
+            uartPrintInt(latest_right_distance);
+            uartPrint("cm IR:");
+            uartPrintInt(latest_ir_distance);
+            uartPrint("cm\r\n");
         }
+
+        // ---------------- ALGORITHM ---------------- // 
         
-        counter++;
-
-        _delay_ms(10); */
-
-        // IR Sensor
-/*         uint16_t distanceIR = getDistanceTop();
-        uartPrint("IR Distance\r\n");
-        uartPrintInt(distanceIR);
-        uartPrint("cm\r\n");
-        _delay_ms(500);
-
-        if (distanceIR > 40)
-        {
-            stopLiftFan();
-
-            // TODO: stop thrust
-        } else {
-            // TODO: Continue
-        } */
-        
-
-        // US Sensor test
-        /* uint32_t distanceLeft32 = getDistanceLeft();
-        if (distanceLeft32 == 9999)
-        {
-            uartPrint("US Sensor left error\r\n");
-        } else {
-            uartPrint("LEFT: ");
-            uartPrintInt(distanceLeft32);
-            uartPrint("cm \r\n");
-        }
-
-        uint32_t distanceRight32 = getDistanceRight();
-        if (distanceRight32 == 9999) {
-            uartPrint("US Sensor right error\r\n");
-        } else {
-            uartPrint("RIGHT: ");
-            uartPrintInt(distanceRight32);
-            uartPrint(" cm\r\n");
-        }
-
-        _delay_ms(500); */
-
-        // Test lift fan
-		startLiftFan();
-        setThrustFan(200);
-		uartPrint("Starting...\r\n");
-		_delay_ms(20000);
-		uartPrint("Stopping...\r\n");
-		stopLiftFan();
-        setThrustFan(0);
-		_delay_ms(5000);
-	}
+    }
 }
