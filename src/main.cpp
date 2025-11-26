@@ -20,6 +20,9 @@
 
 #define IMU_ADDR 0x68
 
+float TURN_ANGLE = 20.0f;
+double TURN_DISTANCE = 50.0;
+
 typedef enum
 {
     FORWARD,
@@ -53,7 +56,7 @@ volatile uint32_t pulse_width_right = 0;
 volatile uint32_t echo_start_left = 0;
 volatile uint32_t echo_start_right = 0;
 
-uint32_t left_distance = 0;
+uint32_t front_distance = 0;
 uint32_t right_distance = 0;
 
 uint16_t ir_distance = 0;
@@ -434,6 +437,17 @@ void setup() {
     sei();
 }
 
+float normalizeAngle(float angle) {
+    while (angle > 180.0f) angle -= 360.0f;
+    while (angle < -180.0f) angle += 360.0f;
+    return angle;
+}
+
+float angleDifference(float target, float current) {
+    float diff = target - current;
+    return normalizeAngle(diff);
+}
+
 // Add these variables at the top with your other globals
 float target_yaw = 0.0f;
 unsigned long turn_start_time = 0;
@@ -455,9 +469,7 @@ int main() {
 
     SYS_STATE system_state = FORWARD;
     TURN_DIRECTION turning_state = STRAIGHT;
-
     int turning_counter = 0;
-    int servo_counter = 0;
 
     startLiftFan();
 
@@ -469,6 +481,7 @@ int main() {
         if (now - last_imu_time >= 10) {
             readIMU();
             yaw += gyrZ * 0.01;
+            yaw = normalizeAngle(yaw);
             last_imu_time = now;
         }
         
@@ -478,7 +491,7 @@ int main() {
             if (us_toggle == 0) {
                 triggerUS_Left();
                 _delay_ms(30);
-                left_distance = getDistance_Left();
+                front_distance = getDistance_Left();
                 pulse_width_left = 0;
             } else {
                 triggerUS_Right();
@@ -496,7 +509,7 @@ int main() {
         // ---------------- Debugging ---------------- //
         if (now - last_print >= 500) {
             uartPrint("L:");
-            uartPrintInt(left_distance);
+            uartPrintInt(front_distance);
             uartPrint("cm R:");
             uartPrintInt(right_distance);
             uartPrint("cm IR:");
@@ -518,85 +531,78 @@ int main() {
             case FORWARD: {// Forward state
             setThrustFan(255);
 
-            float yaw_error = yaw - system_yaw;
-            float servo_correction = yaw_error * 3.5f;
-            
+            /* float yaw_error = yaw - system_yaw;
+            float servo_correction = yaw_error * 2.5f; */
+
+            float yaw_error = angleDifference(system_yaw, yaw);
+            float servo_correction = -yaw_error * 2.5f;
+
             // Clamp servo correction
             if (servo_correction > 45) servo_correction = 45;
             if (servo_correction < -45) servo_correction = -45;
             set_servo_angle(servo_correction);
         
-            // turning decision then change state
-            if ((left_distance > 80.0) && (left_distance != 9999))
+            // Change to TURNING state when wall detected in front
+            if ((front_distance < TURN_DISTANCE) && (front_distance > 10.0) && (front_distance != 9999))
             {
-                turning_counter++;
-                if (turning_counter > 3)
+                if (turning_counter < 10) turning_counter++;
+                
+                if (turning_counter >= 10)
                 {
-                    system_yaw = yaw;
-                    target_yaw = yaw + 20.0f;
-                    
-                    turning_state = LEFT;
-                    system_state = TURNING;
-                    turn_start_time = now;
+                    if ((right_distance >= 80) && (right_distance != 9999)) // Turn right
+                    {
+                        system_yaw = yaw;
+                        target_yaw = normalizeAngle(yaw - TURN_ANGLE);
+                        system_state = TURNING;
+                        turning_state = RIGHT;
+                        turn_start_time = now;
+                        turning_counter = 0;
+                    } else  if (right_distance < 80 && right_distance != 9999){
+                        system_yaw = yaw;
+                        target_yaw = normalizeAngle(yaw + TURN_ANGLE);
+                        system_state = TURNING;
+                        turning_state = LEFT;
+                        turn_start_time = now;
+                        turning_counter = 0;
+                    }
                 }
-            } 
-            else if ((right_distance > 80.0) && (right_distance != 9999)) 
-            {
-                turning_counter++;
-                if (turning_counter > 3)
-                {
-                    // IMPORTANT: Save current yaw as reference
-                    system_yaw = yaw;
-                    target_yaw = yaw - 20.0f;
-                    
-                    turning_state = RIGHT;
-                    system_state = TURNING;
-                    turn_start_time = now;
-                }
-            }
-            else
-            {
-                // Reset counter if conditions not met
-                turning_counter = 0;
             }
             
             break; }
         
         case TURNING: { // Turning state            
+            // Define an acceptable margin of error (e.g., within 3 degrees)
+            const float TURN_COMPLETE_THRESHOLD = 3.0f; 
+
+            // Calculate the remaining angle to turn
+            float remaining_angle = angleDifference(target_yaw, yaw);
+            
+            // Check if the turn is complete or if a timeout occurred
+            if ((fabs(remaining_angle) <= TURN_COMPLETE_THRESHOLD) || (now - turn_start_time > 3000))
+            {
+                // Turn is complete or timed out (max 3 seconds)
+                set_servo_angle(0);
+                system_yaw = yaw; // Update system_yaw to the new orientation
+                turning_state = STRAIGHT;
+                system_state = FORWARD;
+                break;
+            }
+
             if (turning_state == LEFT)
             {
-                setThrustFan(250);
-                set_servo_angle(servo_counter);
-                servo_counter -= 1;
-
-                if (yaw >= target_yaw || (now - turn_start_time > 10000))
-                {
-                    set_servo_angle(0);
-                    system_yaw = yaw;
-                    turning_state = STRAIGHT;
-                    system_state = FORWARD;
-                    turning_counter = 0;
-                    servo_counter = 0;
-                }
+                setThrustFan(210);
+                // Set the servo to the maximum deflection for a Left turn
+                set_servo_angle(-120); 
             } 
             else if (turning_state == RIGHT) 
             {
-                set_servo_angle(servo_counter);
-                setThrustFan(250);
-                servo_counter += 1;
-
-                if (yaw <= target_yaw || (now - turn_start_time > 10000))
-                {
-                    set_servo_angle(0);
-                    system_yaw = yaw;
-                    turning_state = STRAIGHT;
-                    system_state = FORWARD;
-                    turning_counter = 0;
-                    servo_counter = 0;
-                }
+                setThrustFan(210);
+                // Set the servo to the maximum deflection for a Right turn
+                set_servo_angle(120);
             }
             else
             {
+                // Should not happen if logic in FORWARD state is correct
                 system_state = FORWARD;
                 turning_state = STRAIGHT;
             }
