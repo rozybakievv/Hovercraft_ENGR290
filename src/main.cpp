@@ -39,6 +39,9 @@ typedef enum
 
 float system_yaw = 0;
 
+#define FORWARD_TIMEOUT_MS 4000  // 4 seconds
+#define DISTANCE_CHANGE_THRESHOLD 10
+
 // ---------------- IMU Variables ---------------- //
 float gyro_scale = 65.5f;
 float acc_scale = 8192.0f;
@@ -448,9 +451,11 @@ float angleDifference(float target, float current) {
     return normalizeAngle(diff);
 }
 
-// Add these variables at the top with your other globals
 float target_yaw = 0.0f;
 unsigned long turn_start_time = 0;
+bool forward_timeout_active = 0;
+unsigned long forward_start_time = 0;
+bool stuck = false;
 
 int main() {
     setup();
@@ -531,9 +536,6 @@ int main() {
             case FORWARD: {// Forward state
             setThrustFan(255);
 
-            /* float yaw_error = yaw - system_yaw;
-            float servo_correction = yaw_error * 2.5f; */
-
             float yaw_error = angleDifference(system_yaw, yaw);
             float servo_correction = -yaw_error * 2.5f;
 
@@ -541,6 +543,36 @@ int main() {
             if (servo_correction > 45) servo_correction = 45;
             if (servo_correction < -45) servo_correction = -45;
             set_servo_angle(servo_correction);
+
+            if (front_distance < 10 && front_distance != 9999) {
+                if (!forward_timeout_active) {
+                    forward_timeout_active = true;
+                    forward_start_time = now;
+                } else if (now - forward_start_time >= FORWARD_TIMEOUT_MS) {
+                    stuck = true;
+
+                    if ((right_distance >= 80) && (right_distance != 9999)) // turn right
+                    {
+                        system_yaw = yaw;
+                        target_yaw = normalizeAngle(yaw - TURN_ANGLE);
+                        system_state = TURNING;
+                        turning_state = RIGHT;
+                        turn_start_time = now;
+                        turning_counter = 0;
+                    } else if (right_distance < 80 && right_distance != 9999) { // turn left
+                        system_yaw = yaw;
+                        target_yaw = normalizeAngle(yaw + TURN_ANGLE);
+                        system_state = TURNING;
+                        turning_state = LEFT;
+                        turn_start_time = now;
+                        turning_counter = 0;
+                    }
+
+                    forward_timeout_active = false;
+                }
+            } else {
+                forward_timeout_active = false;
+            }
         
             // Change to TURNING state when wall detected in front
             if ((front_distance < TURN_DISTANCE) && (front_distance > 10.0) && (front_distance != 9999))
@@ -585,20 +617,31 @@ int main() {
                 system_yaw = yaw; // Update system_yaw to the new orientation
                 turning_state = STRAIGHT;
                 system_state = FORWARD;
+                stuck = false;
                 break;
             }
 
             if (turning_state == LEFT)
             {
+                if (stuck == true)
+                {
+                    set_servo_angle(-180); 
+                } else {
+                    set_servo_angle(-120); 
+                }
+                
                 setThrustFan(210);
-                // Set the servo to the maximum deflection for a Left turn
-                set_servo_angle(-120); 
             } 
             else if (turning_state == RIGHT) 
             {
                 setThrustFan(210);
                 // Set the servo to the maximum deflection for a Right turn
-                set_servo_angle(120);
+                if (stuck == true)
+                {
+                    set_servo_angle(180);
+                } else {
+                    set_servo_angle(120);
+                }
             }
             else
             {
