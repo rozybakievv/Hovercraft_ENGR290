@@ -599,7 +599,7 @@ int main() {
                     }
                 }
             }
-            
+
             break; }
         
         case TURNING: { // Turning state            
@@ -627,7 +627,7 @@ int main() {
                 {
                     set_servo_angle(-180); 
                 } else {
-                    set_servo_angle(-120); 
+                    set_servo_angle(-140); 
                 }
                 
                 setThrustFan(210);
@@ -640,7 +640,7 @@ int main() {
                 {
                     set_servo_angle(180);
                 } else {
-                    set_servo_angle(120);
+                    set_servo_angle(140);
                 }
             }
             else
