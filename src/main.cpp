@@ -21,7 +21,7 @@
 #define IMU_ADDR 0x68
 
 float TURN_ANGLE = 20.0f;
-double TURN_DISTANCE = 50.0;
+double TURN_DISTANCE = 40.0;
 
 typedef enum
 {
@@ -39,7 +39,7 @@ typedef enum
 
 float system_yaw = 0;
 
-#define FORWARD_TIMEOUT_MS 4000  // 4 seconds
+#define FORWARD_TIMEOUT_MS 2500  // 4 seconds
 #define DISTANCE_CHANGE_THRESHOLD 10
 
 // ---------------- IMU Variables ---------------- //
@@ -599,7 +599,7 @@ int main() {
                     }
                 }
             }
-
+            
             break; }
         
         case TURNING: { // Turning state            
