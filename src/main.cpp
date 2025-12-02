@@ -20,8 +20,8 @@
 
 #define IMU_ADDR 0x68
 
-float TURN_ANGLE = 16.0f;
-double TURN_DISTANCE = 50.0;
+float TURN_ANGLE = 60.0f;
+double TURN_DISTANCE = 40.0;
 
 typedef enum
 {
@@ -475,7 +475,6 @@ int main() {
 
     SYS_STATE system_state = FORWARD;
     TURN_DIRECTION turning_state = STRAIGHT;
-    TURN_DIRECTION last_turn_direction = STRAIGHT;
     int turning_counter = 0;
 
     startLiftFan();
@@ -542,8 +541,8 @@ int main() {
             float servo_correction = -yaw_error * 2.5f;
 
             // Clamp servo correction
-            if (servo_correction > 45) servo_correction = 45;
-            if (servo_correction < -45) servo_correction = -45;
+            if (servo_correction > 90) servo_correction = 90;
+            if (servo_correction < -90) servo_correction = -90;
             set_servo_angle(servo_correction);
 
             // Check if stuck
@@ -555,21 +554,18 @@ int main() {
                     stuck = true;
 
                     // Use last turn direction if available, otherwise decide based on right distance
-                    if (last_turn_direction == RIGHT || 
-                        (last_turn_direction == STRAIGHT && right_distance >= 80 && right_distance != 9999)) {
-                        system_yaw = yaw;  // NEW: Store starting yaw
-                        target_yaw = normalizeAngle(system_yaw - TURN_ANGLE);  // MODIFIED: -15° from start
+                    if (right_distance >= 10 && right_distance != 9999) {
+                        system_yaw = yaw;
+                        target_yaw = normalizeAngle(system_yaw - (TURN_ANGLE-45));  // MODIFIED: -15° from start
                         system_state = TURNING;
                         turning_state = RIGHT;
-                        last_turn_direction = RIGHT;  // NEW: Remember this turn
                         turn_start_time = now;
                         turning_counter = 0;
-                    } else {
-                        system_yaw = yaw;  // NEW: Store starting yaw
-                        target_yaw = normalizeAngle(system_yaw + TURN_ANGLE);  // MODIFIED: +15° from start
+                    } else if (right_distance < 10 && right_distance != 9999){
+                        system_yaw = yaw;
+                        target_yaw = normalizeAngle(system_yaw + (TURN_ANGLE-45));
                         system_state = TURNING;
                         turning_state = LEFT;
-                        last_turn_direction = LEFT;  // NEW: Remember this turn
                         turn_start_time = now;
                         turning_counter = 0;
                     }
@@ -583,25 +579,23 @@ int main() {
             // Change to TURNING state when wall detected in front
             if ((front_distance < TURN_DISTANCE) && (front_distance > 10.0) && (front_distance != 9999))
             {
-                if (turning_counter < 10) turning_counter++;
+                if (turning_counter < 5) turning_counter++;
                 
-                if (turning_counter >= 10)
+                if (turning_counter >= 5)
                 {
-                    if ((right_distance >= 70) && (right_distance != 9999)) // Turn right
+                    if ((right_distance >= 50) && (right_distance != 9999)) // Turn right
                     {
                         system_yaw = yaw;
                         target_yaw = normalizeAngle(yaw - TURN_ANGLE);
                         system_state = TURNING;
                         turning_state = RIGHT;
-                        last_turn_direction = RIGHT;
                         turn_start_time = now;
                         turning_counter = 0;
-                    } else  if (right_distance < 70 && right_distance != 9999){
+                    } else  if (right_distance < 50 && right_distance != 9999){
                         system_yaw = yaw;
                         target_yaw = normalizeAngle(yaw + TURN_ANGLE);
                         system_state = TURNING;
                         turning_state = LEFT;
-                        last_turn_direction = LEFT;
                         turn_start_time = now;
                         turning_counter = 0;
                     }
@@ -612,7 +606,7 @@ int main() {
         
         case TURNING: { // Turning state            
             // Define an acceptable margin of error (e.g., within 3 degrees)
-            const float TURN_COMPLETE_THRESHOLD = 3.0f; 
+            const float TURN_COMPLETE_THRESHOLD = 1.0f; 
 
             // Calculate the remaining angle to turn
             float remaining_angle = angleDifference(target_yaw, yaw);
@@ -635,19 +629,19 @@ int main() {
                 {
                     set_servo_angle(-180); 
                 } else {
-                    set_servo_angle(-140); 
+                    set_servo_angle(90); 
                 }
                 
-                setThrustFan(120);
+                setThrustFan(200);
             } 
             else if (turning_state == RIGHT) 
             {
-                setThrustFan(120);
+                setThrustFan(200);
                 if (stuck == true)
                 {
                     set_servo_angle(180);
                 } else {
-                    set_servo_angle(140);
+                    set_servo_angle(90);
                 }
             }
             else
